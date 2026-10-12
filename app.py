@@ -323,6 +323,22 @@ ORDER BY in_transit_count DESC"""
 }
 
 
+# Markdown code fence (three backticks), built programmatically so the source
+# never contains a literal triple-backtick sequence (keeps copy/paste safe).
+FENCE = "`" * 3
+
+
+def strip_code_fences(text):
+    """Remove Markdown code fences (sql-tagged and generic) and extra whitespace from LLM SQL output."""
+    # Remove Markdown code fences with an sql tag and extra whitespace
+    text = re.sub(r'^' + FENCE + r'sql\s*|\s*' + FENCE + r'$', '', text, flags=re.IGNORECASE | re.MULTILINE).strip()
+
+    # Remove generic Markdown code fences and extra whitespace
+    text = re.sub(r'^' + FENCE + r'\s*|\s*' + FENCE + r'$', '', text, flags=re.MULTILINE).strip()
+
+    return text
+
+
 # ============================================================
 # Tool 1: Intent classification
 # Routes the question to a verified template or fresh SQL generation.
@@ -426,11 +442,7 @@ Return ONLY the SQL query, with no markdown code blocks, no comments, and no exp
     sql = llm.invoke(generation_prompt).content.strip()
 
     # Strip markdown fences if present
-    # Remove Markdown code fences (```sql ... ```) and extra whitespace from the extracted SQL
-    sql = re.sub(r'^```sql\s*|\s*```$', '', sql, flags=re.IGNORECASE | re.MULTILINE).strip()
-
-    # Remove generic Markdown code fences (``` ... ```) and extra whitespace
-    sql = re.sub(r'^```\s*|\s*```$', '', sql, flags=re.MULTILINE).strip()
+    sql = strip_code_fences(sql)
 
     return sql
 
@@ -714,11 +726,8 @@ Return ONLY the corrected SQL, with no markdown code blocks, no comments, and no
 
     revised_sql = llm.invoke(retry_prompt).content.strip()
 
-    # Remove Markdown code fences (```sql ... ```) and extra whitespace from the extracted SQL
-    revised_sql = re.sub(r'^```sql\s*|\s*```$', '', revised_sql, flags=re.IGNORECASE | re.MULTILINE).strip()
-
-    # Remove generic Markdown code fences (``` ... ```) and extra whitespace
-    revised_sql = re.sub(r'^```\s*|\s*```$', '', revised_sql, flags=re.MULTILINE).strip()
+    # Strip markdown fences if present
+    revised_sql = strip_code_fences(revised_sql)
 
     return revised_sql
 
@@ -734,4 +743,635 @@ def execute_query(validated_sql, db_connection):
 
     Parameters:
     - validated_sql (str): SQL query that has passed all validation checks.
-    - db_connection:
+    - db_connection: Read-only SQLite connection object.
+
+    Returns:
+    - dict: Contains 'dataframe' (pandas DataFrame), 'reasonable' (bool),
+            and 'warnings' (list of warning strings).
+    '''
+
+    # Initialize the result structure with default values.
+    # The DataFrame will be populated after the SQL query is executed.
+    result = {
+        'dataframe': None,
+        'reasonable': True,
+        'warnings': []
+    }
+
+    # Execute the validated SQL query and store the results in a DataFrame.
+    df = pd.read_sql_query(validated_sql, db_connection)
+    result['dataframe'] = df
+
+    # Perform basic reasonableness checks on the query results.
+    # These checks flag potential data-quality issues but do not stop execution.
+
+    # Check whether the query returned any rows.
+    if df.empty:
+        result['warnings'].append('Query returned an empty result')
+
+    # Check numeric columns for potentially unexpected values.
+    for col in df.select_dtypes(include='number').columns:
+
+        # Flag negative values unless the column represents a deviation or change,
+        # where negative values can be valid and meaningful.
+        if (df[col] < 0).any() and 'deviation' not in col.lower() and 'change' not in col.lower():
+            result['warnings'].append(f'Column {col} contains negative values')
+
+        # Check for missing (NULL/NaN) values in the numeric column.
+        if df[col].isnull().any():
+            null_count = df[col].isnull().sum()
+
+            # Warn when more than 50% of the column values are missing,
+            # as this may indicate a data-quality or query issue.
+            if null_count > len(df) * 0.5:
+                result['warnings'].append(f'Column {col} has {null_count} null values')
+
+    return result
+
+
+# ============================================================
+# Tool 6: Response generation
+# Writes a concise, business-focused answer from the query result.
+# ============================================================
+
+def generate_response(user_question, dataframe, route, query_id=None):
+    '''
+    Generates a focused natural language response from the query result.
+
+    Parameters:
+    - user_question (str): The original user question.
+    - dataframe (pd.DataFrame): The full query result.
+    - route (str): 'verified' or 'generated'.
+    - query_id (str, optional): Template ID if from verified track.
+
+    Returns:
+    - str: Natural language response focused on what the user asked.
+    '''
+
+    response_prompt = f"""
+### ROLE
+You are a supply chain operations analyst writing a concise business response for a fulfillment or inventory question.
+
+### INPUT
+User Question: {user_question}
+
+Query Result Data:
+{dataframe.to_string()}
+
+### INSTRUCTIONS
+1. Answer the user's specific question directly. Do not dump the entire table.
+2. If the user asked about a specific region, warehouse, carrier, or category, highlight only those rows.
+3. Provide context from other rows only when it adds value (for example, ranking or comparison).
+4. State exact numbers from the data. Do not round beyond what is shown.
+5. Flag anything notable, such as a warehouse close to a capacity threshold or a carrier significantly worse than peers.
+6. Use clear, professional language suitable for a fulfillment operations memo.
+7. Keep the response focused. Two to four sentences for simple questions, up to a short paragraph for complex ones.
+8. State the unit for every number, inferred from its column name: _usd as "$X", _pct or _percent as "X%", _count as a plain count, _hours as "X hours". Never state a bare number when the source column implies a unit.
+
+### OUTPUT
+Return ONLY the natural language response text, with no markdown headers or bullet points unless truly needed.
+"""
+
+    response = llm.invoke(response_prompt).content.strip()
+    return response
+
+
+# ============================================================
+# Workflow: single entry point for any user question
+#
+# 1. Classify intent / choose route
+# 2. Build SQL (verified template or freshly generated)
+# 3. Validation gate
+# 4. Retry once if generated SQL fails validation
+# 5. Escalate to a human analyst if still failing
+# 6. Execute the approved SQL on the read-only database
+# 7. Generate the response and record everything in the log
+#
+# In the notebook, intermediate stages were printed. In the app they are
+# collected in a trace list and optionally streamed to the UI via `report`.
+# ============================================================
+
+def run_workflow(user_question, verbose=True, report=None):
+    '''
+    Runs the complete query engine pipeline for a single user question.
+
+    Parameters:
+    - user_question (str): The natural language question.
+    - verbose (bool): If True, records (and streams) intermediate pipeline stages.
+    - report (callable, optional): Called with each trace line as it happens.
+
+    Returns:
+    - dict: Complete pipeline output including response, SQL, data, log and trace.
+    '''
+
+    db_connection = conn
+    query_library = verified_query_library
+    schema_context = database_schema
+
+    trace = []
+
+    def say(message):
+        if verbose:
+            trace.append(message)
+            if report is not None:
+                report(message)
+
+    log = {
+        'user_question': user_question,
+        'route': None,
+        'query_id': None,
+        'match_reason': None,
+        'candidate_sql': None,
+        'gate_result': None,
+        'retry_used': False,
+        'escalated': False,
+        'executed_sql': None,
+        'row_count': None,
+        'confidence': None,
+        'response': None
+    }
+
+    # Step 1: Intent classification
+
+    # run the intent classification tool
+    classification = classify_intent(user_question, query_library)
+
+    # log the output from intent classification tool
+    log['route'] = classification['route']
+    log['query_id'] = classification.get('query_id')
+    log['match_reason'] = classification.get('match_reason')
+
+    say(f"[1] Intent Classification: route={log['route']}, query_id={log['query_id']}")
+    say(f"    Reason: {log['match_reason']}")
+
+
+    # Step 2: Query construction
+
+    if log['route'] == 'verified' and log['query_id'] in query_library:
+        candidate_sql = query_library[log['query_id']]['sql']
+    else:
+        candidate_sql = generate_query(user_question, schema_context)
+
+    # log the chosen SQL query
+    log['candidate_sql'] = candidate_sql
+
+    # record the chosen route
+    say(f"[2] Query Construction: {'loaded from library' if log['route']=='verified' else 'generated fresh SQL'}")
+
+
+    # Step 3: Validation gate
+
+    gate = validate_query(user_question, candidate_sql, db_connection, query_library, log['query_id'])
+
+    # log the validation gate output
+    log['gate_result'] = gate
+    log['confidence'] = gate.get('relevance_confidence')
+
+    # record the validation gate output
+    say(f"[3] Validation Gate: passed={gate['passed']}, relevance_confidence={gate.get('relevance_confidence')}")
+    if not gate['passed']:
+        say(f"    Failed check: {gate.get('failed_check')}")
+        say(f"    Details: {gate.get('details')}")
+
+
+    # Step 4: Retry once on generated track if validation fails
+
+    # if validation fails, send for retry generation
+    if not gate['passed'] and log['route'] == 'generated':
+        say(f"    Retrying: {gate['details']}")
+        candidate_sql = retry_generation(user_question, candidate_sql, gate['details'], schema_context)
+        log['candidate_sql'] = candidate_sql
+        log['retry_used'] = True
+        gate = validate_query(user_question, candidate_sql, db_connection, query_library, None)
+        log['gate_result'] = gate
+
+        # record the validation gate output of the updated query
+        say(f" Retry Validation Gate: passed={gate['passed']}, relevance_confidence={gate.get('relevance_confidence')}")
+        if not gate['passed']:
+            say(f"    Retry failed check: {gate.get('failed_check')}")
+            say(f"    Retry details: {gate.get('details')}")
+
+
+    # Step 5: Escalate if still failing
+
+    # log for escalation to human
+    if not gate['passed']:
+        log['escalated'] = True
+        log['route'] = 'escalate'
+        log['response'] = f"Query could not be reliably resolved. Escalated to human analyst. Failure: {gate['details']}"
+        log['confidence'] = gate.get('relevance_confidence')
+        say(f"[!] Escalated to human: {gate['details']}")
+        return {'log': log, 'dataframe': None, 'trace': trace, 'warnings': [], **log}
+
+
+    # Step 6: Execute
+
+    log['executed_sql'] = candidate_sql
+    exec_result = execute_query(candidate_sql, db_connection)
+    df = exec_result['dataframe']
+    log['row_count'] = len(df)
+
+    # record the execution result
+    say(f"[4] Execute: {len(df)} rows returned")
+    if exec_result['warnings']:
+        say(f"    Warnings: {exec_result['warnings']}")
+
+
+    # Step 7: Response generation
+    response = generate_response(user_question, df, log['route'], log['query_id'])
+    log['response'] = response
+
+    # Confidence: carried directly from the validation gate's relevance check (0-1)
+    log['confidence'] = gate.get('relevance_confidence')
+
+    say(f"[5] Response Generation: confidence={log['confidence']}")
+
+    return {'log': log, 'dataframe': df, 'trace': trace, 'warnings': exec_result['warnings'], **log}
+
+
+# ============================================================
+# Evaluation against ground truth (test_queries.csv)
+# Reproduces the notebook's evaluation: route accuracy, query-ID
+# accuracy (verified cases only) and average confidence.
+# ============================================================
+
+@st.cache_data
+def load_ground_truth(path: str):
+    return pd.read_csv(path)
+
+
+def run_evaluation(ground_truth, progress_callback=None):
+    evaluation_rows = []
+    total = len(ground_truth)
+
+    for i, (_, gt) in enumerate(ground_truth.iterrows()):
+        try:
+            tr = run_workflow(gt['question'], verbose=False)
+        except Exception as exc:  # keep the evaluation going if one case errors
+            tr = {'route': f'error: {exc}', 'query_id': None, 'confidence': None, 'row_count': None}
+
+        evaluation_rows.append({
+            'Test ID': gt['test_id'],
+            'Expected Route': gt['expected_route'],
+            'Actual Route': tr['route'],
+            'Route Match': tr['route'] == gt['expected_route'],
+            'Expected Query ID': gt['expected_query_id'],
+            'Actual Query ID': tr['query_id'],
+            'Query ID Match': (
+                pd.isna(gt['expected_query_id']) and
+                (tr['query_id'] is None or pd.isna(tr['query_id']))
+            ) or tr['query_id'] == gt['expected_query_id'],
+            'Confidence': tr['confidence'],
+            'Rows Returned': tr['row_count']
+        })
+
+        if progress_callback is not None:
+            progress_callback((i + 1) / total, f"Completed {i + 1} of {total}: {gt['test_id']}")
+
+    evaluation_df = pd.DataFrame(evaluation_rows)
+
+    path_accuracy = evaluation_df['Route Match'].mean() * 100
+
+    verified = (
+        evaluation_df['Expected Route'].astype(str).str.strip().str.lower() == 'verified'
+    )
+
+    query_accuracy = (
+        evaluation_df.loc[verified, 'Query ID Match'].mean() * 100
+        if verified.any() else float('nan')
+    )
+
+    average_confidence = pd.to_numeric(
+        evaluation_df['Confidence'], errors='coerce'
+    ).mean()
+
+    return evaluation_df, path_accuracy, query_accuracy, average_confidence
+
+
+# ============================================================
+# UI helpers
+# ============================================================
+
+EXAMPLE_QUESTIONS = [
+    "How many shipments are currently delayed?",
+    "Which 5 warehouses have the highest dollar value of on-hand inventory?",
+    "Do our bonded warehouses run hotter on capacity than the regular ones?",
+    "Which regions have an above-average stockout rate, and how many SKUs are sitting at or below reorder point in those regions?",
+    "For our FTZ warehouses, what's the at-risk inventory value tied to shipments that were delayed more than 2 days, broken out by carrier?",
+    "What's the average employee headcount per warehouse?",
+]
+
+
+def use_example(question: str):
+    """Callback for example buttons: fill the question box and run immediately."""
+    st.session_state["question"] = question
+    st.session_state["auto_run"] = True
+
+
+def confidence_badge(confidence):
+    if isinstance(confidence, (int, float)):
+        if confidence >= 0.8:
+            return "🟢", f"{confidence:.2f}"
+        if confidence >= 0.6:
+            return "🟡", f"{confidence:.2f}"
+        return "🔴", f"{confidence:.2f}"
+    return "⚪", "n/a" if confidence is None else str(confidence)
+
+
+def render_result(result: dict, show_trace: bool):
+    """Render the stored output of the most recent pipeline run."""
+    if result.get("error"):
+        st.error(f"Pipeline failed: {result['error']}")
+        return
+
+    output = result["output"]
+    elapsed = result["elapsed"]
+
+    st.divider()
+    st.caption(f"**Question:** {output['user_question']}")
+
+    # ---------------- Escalation path ----------------
+    if output["escalated"]:
+        st.warning(output["response"])
+        st.caption(
+            f"Route: escalate  ·  Retry used: {output['retry_used']}  ·  "
+            f"Elapsed: {elapsed:.1f}s"
+        )
+
+        with st.expander("Validation details", expanded=True):
+            st.json(output["gate_result"])
+
+        if output["candidate_sql"]:
+            with st.expander("Last candidate SQL (not executed)"):
+                st.code(output["candidate_sql"], language="sql")
+
+    # ---------------- Successful path ----------------
+    else:
+        badge, confidence_display = confidence_badge(output["confidence"])
+
+        st.subheader("Answer")
+        st.write(output["response"])
+
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("Route", output["route"])
+        c2.metric("Template", output["query_id"] or "—")
+        c3.metric("Confidence", f"{badge} {confidence_display}")
+        c4.metric("Rows returned", output["row_count"])
+        c5.metric("Elapsed", f"{elapsed:.1f}s")
+
+        if output.get("warnings"):
+            for w in output["warnings"]:
+                st.warning(w)
+
+        if output["dataframe"] is not None:
+            with st.expander("View underlying data", expanded=True):
+                st.dataframe(output["dataframe"])
+                st.download_button(
+                    "Download result as CSV",
+                    data=output["dataframe"].to_csv(index=False).encode("utf-8"),
+                    file_name="query_result.csv",
+                    mime="text/csv",
+                )
+
+        with st.expander("View executed SQL"):
+            st.code(output["executed_sql"], language="sql")
+
+        with st.expander("Routing and validation details"):
+            st.write(f"**Match reason:** {output['match_reason']}")
+            st.write(f"**Retry used:** {output['retry_used']}")
+            st.json(output["gate_result"])
+
+    if show_trace:
+        with st.expander("Pipeline trace"):
+            st.text("\n".join(output["trace"]))
+
+    with st.expander("Audit log entry (JSON)"):
+        st.json(json.loads(json.dumps(output["log"], default=str)))
+
+
+# ============================================================
+# Session state
+# ============================================================
+
+st.session_state.setdefault("question", "")
+st.session_state.setdefault("auto_run", False)
+st.session_state.setdefault("last_result", None)
+st.session_state.setdefault("history", [])
+st.session_state.setdefault("evaluation", None)
+
+
+# ============================================================
+# Sidebar
+# ============================================================
+
+with st.sidebar:
+    st.header("About")
+    st.write(
+        "This application routes operational questions through a verified SQL "
+        "template library when possible, or generates fresh read-only SQL for "
+        "novel questions. Every query passes a four-check validation gate "
+        "(read-only shape, schema conformance, parse-and-plan dry run, LLM "
+        "relevance) before it touches the database. Failed generated queries are "
+        "retried once, then escalated to a human analyst."
+    )
+
+    show_trace = st.checkbox("Show pipeline trace", value=True)
+
+    st.subheader("Example questions")
+    for i, example in enumerate(EXAMPLE_QUESTIONS):
+        st.button(example, key=f"example_{i}", on_click=use_example, args=(example,))
+
+    st.subheader("Environment")
+    st.caption(f"Database: `{DB_PATH.name}` (read-only)")
+    st.caption(
+        f"Test queries: `{TEST_QUERIES_PATH.name}` "
+        + ("found" if TEST_QUERIES_PATH.exists() else "not found (Evaluation tab disabled)")
+    )
+
+
+# ============================================================
+# Main page
+# ============================================================
+
+st.title("📦 Inventory & Fulfillment Exception Engine")
+st.caption(
+    "Ask natural-language questions about inventory, warehouses, shipments, "
+    "and carrier performance. Answers come from verified or validated read-only SQL "
+    "on the local database."
+)
+
+tab_ask, tab_eval, tab_library, tab_log = st.tabs(
+    ["Ask a question", "Evaluation", "Query library & schema", "Session log"]
+)
+
+
+# ---------------- Tab 1: Ask a question ----------------
+
+with tab_ask:
+    st.text_area(
+        "Your question",
+        key="question",
+        height=90,
+        placeholder="e.g. Which warehouses are operating above 85% capacity?",
+    )
+
+    run_clicked = st.button("Run query", type="primary")
+    auto_run = st.session_state.pop("auto_run", False)
+
+    if run_clicked or auto_run:
+        question = st.session_state["question"].strip()
+
+        if not question:
+            st.info("Please enter a question first.")
+        else:
+            start = time.perf_counter()
+            status = st.status("Running pipeline...", expanded=show_trace)
+
+            def report(message):
+                if show_trace:
+                    status.text(message)
+
+            try:
+                output = run_workflow(question, verbose=True, report=report)
+                elapsed = time.perf_counter() - start
+
+                status.update(
+                    label=(
+                        "Escalated to human review"
+                        if output["escalated"] else "Pipeline complete"
+                    ),
+                    state="error" if output["escalated"] else "complete",
+                    expanded=False,
+                )
+
+                st.session_state["last_result"] = {
+                    "output": output, "elapsed": elapsed, "error": None
+                }
+
+                # Session audit log (in memory only)
+                entry = dict(output["log"])
+                entry["timestamp"] = datetime.now().isoformat(timespec="seconds")
+                entry["elapsed_seconds"] = round(elapsed, 2)
+                st.session_state["history"].append(entry)
+
+            except Exception as exc:
+                status.update(label="Pipeline error", state="error", expanded=False)
+                st.session_state["last_result"] = {
+                    "output": None, "elapsed": None, "error": str(exc)
+                }
+
+    if st.session_state["last_result"] is not None:
+        render_result(st.session_state["last_result"], show_trace)
+
+
+# ---------------- Tab 2: Evaluation ----------------
+
+with tab_eval:
+    st.subheader("Evaluation against ground truth")
+    st.write(
+        "Runs every case in `test_queries.csv` through the workflow and reports "
+        "**Selected Path Accuracy**, **Selected Query Accuracy** (verified cases only) "
+        "and **Average Confidence Score**."
+    )
+
+    if not TEST_QUERIES_PATH.exists():
+        st.info(
+            f"`{TEST_QUERIES_PATH.name}` was not found next to `app.py`. "
+            "Add it (or set `TEST_QUERIES_PATH`) to enable this tab."
+        )
+    else:
+        ground_truth = load_ground_truth(str(TEST_QUERIES_PATH))
+
+        with st.expander("Ground-truth test cases", expanded=False):
+            st.dataframe(ground_truth)
+
+        if st.button("Run evaluation", type="primary"):
+            progress = st.progress(0.0, text="Starting evaluation...")
+
+            def on_progress(fraction, text):
+                progress.progress(fraction, text=text)
+
+            st.session_state["evaluation"] = run_evaluation(ground_truth, on_progress)
+            progress.empty()
+
+        if st.session_state["evaluation"] is not None:
+            evaluation_df, path_accuracy, query_accuracy, average_confidence = (
+                st.session_state["evaluation"]
+            )
+
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Selected Path Accuracy", f"{path_accuracy:.1f}%")
+            m2.metric(
+                "Selected Query Accuracy (verified only)",
+                "n/a" if pd.isna(query_accuracy) else f"{query_accuracy:.1f}%",
+            )
+            m3.metric(
+                "Average Confidence Score",
+                "n/a" if pd.isna(average_confidence) else f"{average_confidence:.2f}",
+            )
+
+            st.dataframe(evaluation_df)
+
+
+# ---------------- Tab 3: Query library & schema ----------------
+
+with tab_library:
+    st.subheader("Verified query template library")
+    st.caption(
+        f"{len(verified_query_library)} pre-approved templates. Each has a plain-English "
+        "description (used for routing) and a verified SQL query."
+    )
+    for qid, entry in verified_query_library.items():
+        with st.expander(f"{qid}: {entry['description']}"):
+            st.code(entry["sql"], language="sql")
+
+    st.subheader("Database schema (passed to the LLM)")
+    st.code(database_schema, language="text")
+
+    st.subheader("Table preview")
+    table_choice = st.selectbox("Table", DB_TABLES)
+    try:
+        st.dataframe(pd.read_sql_query(f"SELECT * FROM {table_choice} LIMIT 5", conn))
+    except Exception as exc:
+        st.error(f"Could not read table `{table_choice}`: {exc}")
+
+
+# ---------------- Tab 4: Session log ----------------
+
+with tab_log:
+    st.subheader("Session audit log")
+    st.caption(
+        "Every question run in this browser session, with route, SQL, validation "
+        "outcome and confidence. Held in memory only; download it to keep a copy."
+    )
+
+    history = st.session_state["history"]
+    if not history:
+        st.info("No queries have been run yet in this session.")
+    else:
+        summary_rows = [
+            {
+                "Time": h["timestamp"],
+                "Question": h["user_question"],
+                "Route": h["route"],
+                "Query ID": h["query_id"],
+                "Retry used": h["retry_used"],
+                "Escalated": h["escalated"],
+                "Confidence": h["confidence"],
+                "Rows": h["row_count"],
+                "Seconds": h["elapsed_seconds"],
+            }
+            for h in history
+        ]
+        st.dataframe(pd.DataFrame(summary_rows))
+
+        st.download_button(
+            "Download full log (JSON)",
+            data=json.dumps(history, indent=2, default=str).encode("utf-8"),
+            file_name="query_audit_log.json",
+            mime="application/json",
+        )
+
+        if st.button("Clear session log"):
+            st.session_state["history"] = []
+            st.rerun()
