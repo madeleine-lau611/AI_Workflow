@@ -1,0 +1,7 @@
+streamlit
+langchain==1.3.18
+langchain-core==1.6.2
+langchain-openai==1.6.2
+pandas==2.2.3
+numpy==2.1.3
+sqlparse==0.6.0
